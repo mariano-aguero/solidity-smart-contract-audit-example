@@ -21,22 +21,19 @@ jobs:
       - name: Parse audit request
         id: parse
         run: |
-          # Extract contract path from comment (e.g., "/audit contracts/VulnerableVault.sol")
           COMMENT="${{ github.event.comment.body }}"
           CONTRACT=$(echo "$COMMENT" | grep -oP '/audit\s+\K\S+' || echo "")
 
           if [ -z "$CONTRACT" ]; then
-            echo "No contract specified. Looking for all .sol files..."
-            CONTRACT="all"
+            echo "contract=all" >> $GITHUB_OUTPUT
+          else
+            echo "contract=$CONTRACT" >> $GITHUB_OUTPUT
           fi
-
-          echo "contract=$CONTRACT" >> $GITHUB_OUTPUT
 
       - name: Run Security Audit
         id: audit
         run: |
           CONTRACT="${{ steps.parse.outputs.contract }}"
-          REPORT=""
 
           if [ "$CONTRACT" = "all" ]; then
             FILES=$(find contracts -name "*.sol" -type f 2>/dev/null || echo "")
@@ -45,20 +42,15 @@ jobs:
           fi
 
           if [ -z "$FILES" ]; then
-            echo "report=No Solidity files found." >> $GITHUB_OUTPUT
+            echo "findings=No Solidity files found." >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          echo "## Security Audit Report" > report.md
-          echo "" >> report.md
-          echo "Triggered by: @${{ github.event.comment.user.login }}" >> report.md
-          echo "" >> report.md
+          FULL_REPORT=""
 
           for file in $FILES; do
             if [ -f "$file" ]; then
               echo "Auditing $file..."
-              echo "### $file" >> report.md
-              echo "" >> report.md
 
               # Read contract and escape for JSON
               CONTENT=$(cat "$file" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
@@ -74,32 +66,138 @@ jobs:
               # Extract result
               RESULT=$(echo "$RESPONSE" | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data.get("result", data.get("error", "No response")))' 2>/dev/null || echo "Parse error")
 
-              echo '```' >> report.md
-              echo "$RESULT" | head -100 >> report.md
-              echo '```' >> report.md
-              echo "" >> report.md
+              FULL_REPORT="${FULL_REPORT}
+
+          ### 📄 ${file}
+
+          \`\`\`
+          ${RESULT}
+          \`\`\`
+          "
             fi
           done
 
-          cat report.md
+          # Save report to file (GitHub has issues with multiline outputs)
+          echo "$FULL_REPORT" > /tmp/audit_report.txt
 
-      - name: Comment on Issue
+          # Also save raw findings for Claude
+          echo "$FULL_REPORT" > /tmp/raw_findings.txt
+
+      - name: Claude AI Analysis
+        id: claude
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          # Read the audit findings
+          FINDINGS=$(cat /tmp/raw_findings.txt)
+
+          # Check if we have an API key
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "No ANTHROPIC_API_KEY configured - skipping AI analysis"
+            echo "## 🤖 Claude Analysis" > /tmp/claude_analysis.txt
+            echo "" >> /tmp/claude_analysis.txt
+            echo "_AI analysis not available. Add ANTHROPIC_API_KEY secret to enable._" >> /tmp/claude_analysis.txt
+            exit 0
+          fi
+
+          # Prepare prompt for Claude
+          PROMPT=$(cat << 'PROMPT_END'
+          Sos un experto en seguridad de smart contracts. Analizá los siguientes findings de una auditoría automatizada y proporcioná:
+
+          1. **Resumen Ejecutivo**: Un párrafo con el estado general de seguridad del contrato
+          2. **Findings Críticos**: Los 3-5 problemas más importantes que deben solucionarse antes de deployar
+          3. **Recomendaciones**: Pasos concretos para solucionar cada problema crítico
+          4. **Riesgo General**: Bajo/Medio/Alto/Crítico con justificación
+
+          Sé conciso y práctico. Enfocate en lo que realmente importa para la seguridad.
+
+          FINDINGS DE LA AUDITORÍA:
+          PROMPT_END
+          )
+
+          # Escape findings for JSON
+          ESCAPED_FINDINGS=$(echo "$FINDINGS" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
+          ESCAPED_PROMPT=$(echo "$PROMPT" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
+
+          # Call Claude API
+          CLAUDE_RESPONSE=$(curl -s -X POST "https://api.anthropic.com/v1/messages" \
+            -H "Content-Type: application/json" \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -d "{
+              \"model\": \"claude-sonnet-4-20250514\",
+              \"max_tokens\": 2000,
+              \"messages\": [{
+                \"role\": \"user\",
+                \"content\": ${ESCAPED_PROMPT}\n\n${ESCAPED_FINDINGS}
+              }]
+            }" --max-time 60 || echo '{"error": "Claude API timeout"}')
+
+          # Extract Claude's response
+          ANALYSIS=$(echo "$CLAUDE_RESPONSE" | python3 -c '
+          import json, sys
+          try:
+              data = json.load(sys.stdin)
+              if "content" in data and len(data["content"]) > 0:
+                  print(data["content"][0].get("text", "No analysis available"))
+              elif "error" in data:
+                  print(f"Error: {data[\"error\"].get(\"message\", str(data[\"error\"]))}")
+              else:
+                  print("No analysis available")
+          except Exception as e:
+              print(f"Parse error: {e}")
+          ' 2>/dev/null || echo "Error parsing Claude response")
+
+          # Save Claude's analysis
+          echo "## 🤖 Claude Analysis" > /tmp/claude_analysis.txt
+          echo "" >> /tmp/claude_analysis.txt
+          echo "$ANALYSIS" >> /tmp/claude_analysis.txt
+
+      - name: Post Combined Report
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            let report = '';
+
+            let auditReport = '';
+            let claudeAnalysis = '';
 
             try {
-              report = fs.readFileSync('report.md', 'utf8');
+              auditReport = fs.readFileSync('/tmp/audit_report.txt', 'utf8');
             } catch (e) {
-              report = 'Error reading audit report.';
+              auditReport = 'Error reading audit report.';
             }
 
-            // Truncate if too long for GitHub comment (max 65536 chars)
-            if (report.length > 60000) {
-              report = report.substring(0, 60000) + '\n\n... (truncated)';
+            try {
+              claudeAnalysis = fs.readFileSync('/tmp/claude_analysis.txt', 'utf8');
+            } catch (e) {
+              claudeAnalysis = '## 🤖 Claude Analysis\n\n_Analysis not available._';
             }
+
+            const fullReport = `# 🔍 Security Audit Report
+
+            Triggered by: @${{ github.event.comment.user.login }}
+
+            ---
+
+            ${claudeAnalysis}
+
+            ---
+
+            ## 🛠️ Automated Findings (Slither + Aderyn + Slang)
+
+            ${auditReport}
+
+            ---
+
+            _Generated by [Solidity Audit MCP](https://github.com/mariano-aguero/solidity-audit-mcp)_
+            `;
+
+            // Truncate if too long
+            const maxLength = 60000;
+            const report = fullReport.length > maxLength
+              ? fullReport.substring(0, maxLength) + '\n\n... (truncated)'
+              : fullReport;
 
             await github.rest.issues.createComment({
               issue_number: context.issue.number,
