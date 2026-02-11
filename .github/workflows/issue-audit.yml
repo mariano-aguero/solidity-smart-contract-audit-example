@@ -1,0 +1,105 @@
+name: Audit on Issue Comment
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  audit:
+    # Trigger when comment contains "/audit"
+    if: contains(github.event.comment.body, '/audit')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Parse audit request
+        id: parse
+        run: |
+          # Extract contract path from comment (e.g., "/audit contracts/VulnerableVault.sol")
+          COMMENT="${{ github.event.comment.body }}"
+          CONTRACT=$(echo "$COMMENT" | grep -oP '/audit\s+\K\S+' || echo "")
+
+          if [ -z "$CONTRACT" ]; then
+            echo "No contract specified. Looking for all .sol files..."
+            CONTRACT="all"
+          fi
+
+          echo "contract=$CONTRACT" >> $GITHUB_OUTPUT
+
+      - name: Run Security Audit
+        id: audit
+        run: |
+          CONTRACT="${{ steps.parse.outputs.contract }}"
+          REPORT=""
+
+          if [ "$CONTRACT" = "all" ]; then
+            FILES=$(find contracts -name "*.sol" -type f 2>/dev/null || echo "")
+          else
+            FILES="$CONTRACT"
+          fi
+
+          if [ -z "$FILES" ]; then
+            echo "report=No Solidity files found." >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "## Security Audit Report" > report.md
+          echo "" >> report.md
+          echo "Triggered by: @${{ github.event.comment.user.login }}" >> report.md
+          echo "" >> report.md
+
+          for file in $FILES; do
+            if [ -f "$file" ]; then
+              echo "Auditing $file..."
+              echo "### $file" >> report.md
+              echo "" >> report.md
+
+              # Read contract and escape for JSON
+              CONTENT=$(cat "$file" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
+
+              # Call MCP API
+              RESPONSE=$(curl -s -X POST \
+                "${{ vars.MCP_SERVER_URL }}/api/analyze" \
+                -H "Content-Type: application/json" \
+                -H "X-API-Key: ${{ secrets.MCP_API_KEY }}" \
+                -d "{\"source\": $CONTENT, \"filename\": \"$(basename $file)\"}" \
+                --max-time 180 || echo '{"error": "API timeout"}')
+
+              # Extract result
+              RESULT=$(echo "$RESPONSE" | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data.get("result", data.get("error", "No response")))' 2>/dev/null || echo "Parse error")
+
+              echo '```' >> report.md
+              echo "$RESULT" | head -100 >> report.md
+              echo '```' >> report.md
+              echo "" >> report.md
+            fi
+          done
+
+          cat report.md
+
+      - name: Comment on Issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let report = '';
+
+            try {
+              report = fs.readFileSync('report.md', 'utf8');
+            } catch (e) {
+              report = 'Error reading audit report.';
+            }
+
+            // Truncate if too long for GitHub comment (max 65536 chars)
+            if (report.length > 60000) {
+              report = report.substring(0, 60000) + '\n\n... (truncated)';
+            }
+
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: report
+            });

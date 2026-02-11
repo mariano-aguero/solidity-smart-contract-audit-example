@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "solidity-audit": {
+      "transport": {
+        "type": "sse",
+        "url": "https://solidity-audit-mcp-production.up.railway.app/sse"
+      }
+    }
+  },
+  "permissions": {
+    "tools": ["analyze_contract", "check_vulnerabilities", "get_contract_info"]
+  }
+}
