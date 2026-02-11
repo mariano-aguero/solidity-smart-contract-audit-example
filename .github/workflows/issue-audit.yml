@@ -88,9 +88,6 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          # Read the audit findings
-          FINDINGS=$(cat /tmp/raw_findings.txt)
-
           # Check if we have an API key
           if [ -z "$ANTHROPIC_API_KEY" ]; then
             echo "No ANTHROPIC_API_KEY configured - skipping AI analysis"
@@ -100,9 +97,17 @@ jobs:
             exit 0
           fi
 
-          # Prepare prompt for Claude
-          PROMPT=$(cat << 'PROMPT_END'
-          Sos un experto en seguridad de smart contracts. Analizá los siguientes findings de una auditoría automatizada y proporcioná:
+          # Use Python for reliable JSON handling
+          python3 << 'PYTHON_SCRIPT'
+          import json
+          import urllib.request
+          import os
+
+          # Read findings
+          with open('/tmp/raw_findings.txt', 'r') as f:
+              findings = f.read()
+
+          prompt = """Sos un experto en seguridad de smart contracts. Analizá los siguientes findings de una auditoría automatizada y proporcioná:
 
           1. **Resumen Ejecutivo**: Un párrafo con el estado general de seguridad del contrato
           2. **Findings Críticos**: Los 3-5 problemas más importantes que deben solucionarse antes de deployar
@@ -112,46 +117,50 @@ jobs:
           Sé conciso y práctico. Enfocate en lo que realmente importa para la seguridad.
 
           FINDINGS DE LA AUDITORÍA:
-          PROMPT_END
-          )
+          """ + findings
 
-          # Escape findings for JSON
-          ESCAPED_FINDINGS=$(echo "$FINDINGS" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
-          ESCAPED_PROMPT=$(echo "$PROMPT" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
+          # Prepare request
+          data = {
+              "model": "claude-sonnet-4-20250514",
+              "max_tokens": 2000,
+              "messages": [{"role": "user", "content": prompt}]
+          }
 
-          # Call Claude API
-          CLAUDE_RESPONSE=$(curl -s -X POST "https://api.anthropic.com/v1/messages" \
-            -H "Content-Type: application/json" \
-            -H "x-api-key: $ANTHROPIC_API_KEY" \
-            -H "anthropic-version: 2023-06-01" \
-            -d "{
-              \"model\": \"claude-sonnet-4-20250514\",
-              \"max_tokens\": 2000,
-              \"messages\": [{
-                \"role\": \"user\",
-                \"content\": ${ESCAPED_PROMPT}\n\n${ESCAPED_FINDINGS}
-              }]
-            }" --max-time 60 || echo '{"error": "Claude API timeout"}')
+          headers = {
+              "Content-Type": "application/json",
+              "x-api-key": os.environ.get("ANTHROPIC_API_KEY", ""),
+              "anthropic-version": "2023-06-01"
+          }
 
-          # Extract Claude's response
-          ANALYSIS=$(echo "$CLAUDE_RESPONSE" | python3 -c '
-          import json, sys
           try:
-              data = json.load(sys.stdin)
-              if "content" in data and len(data["content"]) > 0:
-                  print(data["content"][0].get("text", "No analysis available"))
-              elif "error" in data:
-                  print(f"Error: {data[\"error\"].get(\"message\", str(data[\"error\"]))}")
-              else:
-                  print("No analysis available")
-          except Exception as e:
-              print(f"Parse error: {e}")
-          ' 2>/dev/null || echo "Error parsing Claude response")
+              req = urllib.request.Request(
+                  "https://api.anthropic.com/v1/messages",
+                  data=json.dumps(data).encode('utf-8'),
+                  headers=headers,
+                  method='POST'
+              )
 
-          # Save Claude's analysis
-          echo "## 🤖 Claude Analysis" > /tmp/claude_analysis.txt
-          echo "" >> /tmp/claude_analysis.txt
-          echo "$ANALYSIS" >> /tmp/claude_analysis.txt
+              with urllib.request.urlopen(req, timeout=120) as response:
+                  result = json.loads(response.read().decode('utf-8'))
+
+              if "content" in result and len(result["content"]) > 0:
+                  analysis = result["content"][0].get("text", "No analysis available")
+              else:
+                  analysis = f"Unexpected response: {json.dumps(result)[:500]}"
+
+          except urllib.error.HTTPError as e:
+              error_body = e.read().decode('utf-8')
+              analysis = f"API Error {e.code}: {error_body[:500]}"
+          except Exception as e:
+              analysis = f"Error: {str(e)}"
+
+          # Write analysis
+          with open('/tmp/claude_analysis.txt', 'w') as f:
+              f.write("## 🤖 Claude Analysis\n\n")
+              f.write(analysis)
+
+          print("Claude analysis completed")
+          PYTHON_SCRIPT
 
       - name: Post Combined Report
         uses: actions/github-script@v7
