@@ -1,0 +1,21 @@
+# Foundry build artifacts
+cache/
+out/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment & Secrets (NEVER commit these!)
+.env
+.env.*
+.mcp.json
+
+# Reports (optional - generated files)
+report.md
+AUDIT_REPORT.md

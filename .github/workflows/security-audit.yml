@@ -1,0 +1,72 @@
+name: Security Audit
+
+on:
+  pull_request:
+    paths:
+      - 'contracts/**/*.sol'
+  push:
+    branches: [main]
+    paths:
+      - 'contracts/**/*.sol'
+  workflow_dispatch:  # Manual trigger
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Security Audit
+        id: audit
+        run: |
+          # Find all Solidity files
+          FILES=$(find contracts -name "*.sol" -type f)
+
+          echo "## Security Audit Results" > audit-report.md
+          echo "" >> audit-report.md
+
+          for file in $FILES; do
+            echo "Auditing $file..."
+
+            # Read contract content
+            CONTENT=$(cat "$file" | jq -Rs .)
+
+            # Call MCP server
+            RESPONSE=$(curl -s -X POST \
+              "${{ vars.MCP_SERVER_URL }}/api/analyze" \
+              -H "Content-Type: application/json" \
+              -H "X-API-Key: ${{ secrets.MCP_API_KEY }}" \
+              -d "{\"source\": $CONTENT, \"filename\": \"$file\"}" \
+              --max-time 120)
+
+            echo "### $file" >> audit-report.md
+            echo "" >> audit-report.md
+            echo '```' >> audit-report.md
+            echo "$RESPONSE" | jq -r '.result // .error // "No response"' >> audit-report.md
+            echo '```' >> audit-report.md
+            echo "" >> audit-report.md
+          done
+
+          cat audit-report.md
+
+      - name: Upload Audit Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-audit-report
+          path: audit-report.md
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('audit-report.md', 'utf8');
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: report
+            });
