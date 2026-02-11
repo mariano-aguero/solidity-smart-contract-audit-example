@@ -107,16 +107,16 @@ jobs:
           with open('/tmp/raw_findings.txt', 'r') as f:
               findings = f.read()
 
-          prompt = """Sos un experto en seguridad de smart contracts. Analizá los siguientes findings de una auditoría automatizada y proporcioná:
+          prompt = """You are a smart contract security expert. Analyze the following findings from an automated audit and provide:
 
-          1. **Resumen Ejecutivo**: Un párrafo con el estado general de seguridad del contrato
-          2. **Findings Críticos**: Los 3-5 problemas más importantes que deben solucionarse antes de deployar
-          3. **Recomendaciones**: Pasos concretos para solucionar cada problema crítico
-          4. **Riesgo General**: Bajo/Medio/Alto/Crítico con justificación
+          1. **Executive Summary**: A paragraph with the overall security status of the contract
+          2. **Critical Findings**: The 3-5 most important issues that must be fixed before deployment
+          3. **Recommendations**: Concrete steps to fix each critical issue
+          4. **Overall Risk**: Low/Medium/High/Critical with justification
 
-          Sé conciso y práctico. Enfocate en lo que realmente importa para la seguridad.
+          Be concise and practical. Focus on what really matters for security.
 
-          FINDINGS DE LA AUDITORÍA:
+          AUDIT FINDINGS:
           """ + findings
 
           # Prepare request
