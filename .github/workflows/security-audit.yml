@@ -21,12 +21,125 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch full history for diff
 
-      - name: Run Security Audit
-        id: audit
+      - name: Get changed Solidity files
+        id: changed-files
+        uses: tj-actions/changed-files@v44
+        with:
+          files: |
+            contracts/**/*.sol
+
+      - name: Run Security Audit with Inline Comments
+        if: github.event_name == 'pull_request' && steps.changed-files.outputs.any_changed == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            // Get list of changed .sol files
+            const changedFiles = '${{ steps.changed-files.outputs.all_changed_files }}'.split(' ').filter(f => f.endsWith('.sol'));
+
+            if (changedFiles.length === 0) {
+              console.log('No Solidity files changed');
+              return;
+            }
+
+            console.log(`Analyzing ${changedFiles.length} Solidity files...`);
+
+            // Read file contents
+            const files = [];
+            for (const filePath of changedFiles) {
+              try {
+                const content = fs.readFileSync(filePath, 'utf8');
+                files.push({
+                  filename: filePath,
+                  source: content
+                });
+                console.log(`  - ${filePath} (${content.length} bytes)`);
+              } catch (err) {
+                console.error(`Failed to read ${filePath}: ${err.message}`);
+              }
+            }
+
+            if (files.length === 0) {
+              console.log('No files to analyze');
+              return;
+            }
+
+            // Call MCP server CI review endpoint
+            const serverUrl = '${{ vars.MCP_SERVER_URL }}';
+            const apiKey = '${{ secrets.MCP_API_KEY }}';
+
+            if (!serverUrl) {
+              core.setFailed('MCP_SERVER_URL is not configured');
+              return;
+            }
+
+            const payload = {
+              files: files,
+              github: {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                prNumber: context.issue.number,
+                commitSha: context.payload.pull_request.head.sha,
+                token: '${{ secrets.GITHUB_TOKEN }}'
+              }
+            };
+
+            console.log(`Calling ${serverUrl}/api/ci/review...`);
+
+            try {
+              const response = await fetch(`${serverUrl}/api/ci/review`, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'X-API-Key': apiKey || ''
+                },
+                body: JSON.stringify(payload)
+              });
+
+              const result = await response.json();
+
+              if (!response.ok) {
+                throw new Error(result.error || `HTTP ${response.status}`);
+              }
+
+              console.log('\n=== Audit Results ===');
+              console.log(`Files analyzed: ${result.summary?.filesAnalyzed || 0}`);
+              console.log(`Total findings: ${result.summary?.totalFindings || 0}`);
+              console.log(`  Critical: ${result.summary?.critical || 0}`);
+              console.log(`  High: ${result.summary?.high || 0}`);
+              console.log(`  Medium: ${result.summary?.medium || 0}`);
+              console.log(`  Low: ${result.summary?.low || 0}`);
+              console.log(`  Informational: ${result.summary?.informational || 0}`);
+              console.log(`\nInline comments posted: ${result.review?.inlineCommentsPosted || 0}`);
+              console.log(`Summary comment ID: ${result.summaryComment?.commentId || 'N/A'}`);
+
+              // Fail the workflow if critical or high severity issues found
+              if ((result.summary?.critical || 0) > 0) {
+                core.setFailed(`Found ${result.summary.critical} CRITICAL security issues`);
+              } else if ((result.summary?.high || 0) > 0) {
+                core.warning(`Found ${result.summary.high} HIGH severity security issues`);
+              }
+
+            } catch (err) {
+              console.error(`Audit request failed: ${err.message}`);
+              core.setFailed(`Security audit failed: ${err.message}`);
+            }
+
+      - name: Run Security Audit (Push/Manual)
+        if: github.event_name != 'pull_request'
         run: |
           # Find all Solidity files
-          FILES=$(find contracts -name "*.sol" -type f)
+          FILES=$(find contracts -name "*.sol" -type f 2>/dev/null || true)
+
+          if [ -z "$FILES" ]; then
+            echo "No Solidity files found"
+            exit 0
+          fi
 
           echo "## Security Audit Results" > audit-report.md
           echo "" >> audit-report.md
@@ -56,22 +169,9 @@ jobs:
           cat audit-report.md
 
       - name: Upload Audit Report
+        if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@v4
         with:
           name: security-audit-report
           path: audit-report.md
-
-      - name: Comment on PR
-        if: github.event_name == 'pull_request'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const report = fs.readFileSync('audit-report.md', 'utf8');
-
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: report
-            });
+          if-no-files-found: ignore
