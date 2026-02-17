@@ -10,6 +10,11 @@ on:
       - 'contracts/**/*.sol'
   workflow_dispatch:  # Manual trigger
 
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
 jobs:
   audit:
     runs-on: ubuntu-latest
