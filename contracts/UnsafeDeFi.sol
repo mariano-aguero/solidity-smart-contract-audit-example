@@ -108,6 +108,103 @@ contract UnsafeDeFi {
     // VULNERABILITY: Storage collision risk in upgrades
     uint256[50] private __gap;
 
+    // NEW: Whitelist management
+    mapping(address => bool) public whitelist;
+
+    // NEW: Add tokens to protocol
+    function addSupportedToken(address token) external {
+        // VULNERABILITY (OBVIOUS): Missing access control - anyone can add tokens
+        supportedTokens[token] = true;
+    }
+
+    // NEW: Repay debt function
+    function repay() external payable {
+        Position storage pos = positions[msg.sender];
+        // VULNERABILITY (SUBTLE): Division before multiplication causes precision loss
+        uint256 interestRate = pos.debt / 1000 * 5; // Should be (pos.debt * 5) / 1000
+        uint256 totalOwed = pos.debt + interestRate;
+
+        require(msg.value >= totalOwed, "Insufficient repayment");
+
+        pos.debt = 0;
+        totalBorrows -= pos.debt; // VULNERABILITY (OBVIOUS): Using pos.debt after setting to 0
+
+        // Return excess
+        if (msg.value > totalOwed) {
+            (bool success, ) = msg.sender.call{value: msg.value - totalOwed}("");
+            require(success, "Refund failed");
+        }
+
+        emit Repay(msg.sender, msg.value);
+    }
+
+    // NEW: Withdraw collateral
+    function withdrawCollateral(uint256 amount) external {
+        Position storage pos = positions[msg.sender];
+        require(pos.collateral >= amount, "Insufficient collateral");
+
+        uint256 price = IOracle(oracle).getPrice();
+        uint256 remainingCollateral = pos.collateral - amount;
+
+        // VULNERABILITY (SUBTLE): Check after calculating with potentially stale/manipulated price
+        if (pos.debt > 0) {
+            uint256 minCollateral = (pos.debt * LIQUIDATION_THRESHOLD) / (price * 100);
+            require(remainingCollateral >= minCollateral, "Would be undercollateralized");
+        }
+
+        // VULNERABILITY (SUBTLE): State update before external call but price was fetched earlier
+        pos.collateral = remainingCollateral;
+        totalDeposits -= amount;
+
+        (bool success, ) = msg.sender.call{value: amount}("");
+        require(success, "Transfer failed");
+    }
+
+    // NEW: Emergency pause by admin
+    function emergencyPause(bool _paused) external {
+        // VULNERABILITY (SUBTLE): Using tx.origin instead of msg.sender
+        require(tx.origin == owner, "Not owner");
+        // No pause state variable to set - function does nothing useful
+    }
+
+    // NEW: Batch liquidation
+    function batchLiquidate(address[] calldata users) external {
+        // VULNERABILITY (OBVIOUS): Unbounded loop with external calls
+        for (uint256 i = 0; i < users.length; i++) {
+            Position storage pos = positions[users[i]];
+            uint256 price = IOracle(oracle).getPrice();
+
+            if (pos.collateral * price < pos.debt * LIQUIDATION_THRESHOLD / 100) {
+                uint256 reward = pos.collateral;
+                pos.collateral = 0;
+                pos.debt = 0;
+
+                // External call inside loop - gas griefing + reentrancy
+                (bool success, ) = msg.sender.call{value: reward}("");
+                // VULNERABILITY (SUBTLE): Silently continues if transfer fails
+                // require(success) is missing
+            }
+        }
+    }
+
+    // NEW: Set oracle with timelock
+    function setOracle(address newOracle) external {
+        require(msg.sender == owner, "Not owner");
+        // VULNERABILITY (OBVIOUS): No timelock despite function name implying one
+        // VULNERABILITY (OBVIOUS): No zero address check
+        oracle = newOracle;
+    }
+
+    // NEW: Calculate borrow power
+    function getBorrowPower(address user) external view returns (uint256) {
+        Position memory pos = positions[user];
+        uint256 price = IOracle(oracle).getPrice();
+
+        // VULNERABILITY (SUBTLE): Integer division truncation
+        // If collateral is small and price is low, this can return 0 even when user should be able to borrow
+        return pos.collateral * price * 100 / LIQUIDATION_THRESHOLD - pos.debt;
+    }
+
     receive() external payable {}
 }
 

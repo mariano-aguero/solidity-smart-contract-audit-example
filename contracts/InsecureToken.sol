@@ -91,5 +91,76 @@ contract InsecureToken {
 
     // VULNERABILITY: Floating pragma in production code (see file header)
 
+    // NEW: Batch transfer function
+    function batchTransfer(address[] calldata recipients, uint256 amount) external {
+        // VULNERABILITY (SUBTLE): Overflow in multiplication - can send more than balance
+        uint256 totalAmount = recipients.length * amount;
+        require(balanceOf[msg.sender] >= totalAmount, "Insufficient balance");
+
+        balanceOf[msg.sender] -= totalAmount;
+        for (uint256 i = 0; i < recipients.length; i++) {
+            balanceOf[recipients[i]] += amount;
+            emit Transfer(msg.sender, recipients[i], amount);
+        }
+    }
+
+    // NEW: Set new owner
+    function setOwner(address newOwner) external {
+        require(msg.sender == owner, "Not owner");
+        // VULNERABILITY (OBVIOUS): Missing zero address check for critical ownership transfer
+        owner = newOwner;
+    }
+
+    // NEW: Permit-style approval with signature
+    function permitApprove(
+        address spender,
+        uint256 amount,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external {
+        // VULNERABILITY (SUBTLE): No nonce - signature replay attack possible
+        // VULNERABILITY (SUBTLE): No deadline - signature valid forever
+        bytes32 hash = keccak256(abi.encodePacked(msg.sender, spender, amount));
+        address signer = ecrecover(hash, v, r, s);
+        require(signer == msg.sender, "Invalid signature");
+
+        allowance[msg.sender][spender] = amount;
+        emit Approval(msg.sender, spender, amount);
+    }
+
+    // NEW: Flash mint function
+    function flashMint(address receiver, uint256 amount, bytes calldata data) external {
+        // VULNERABILITY (OBVIOUS): No access control - anyone can flash mint
+        // VULNERABILITY (SUBTLE): No reentrancy protection
+        uint256 balanceBefore = balanceOf[receiver];
+
+        totalSupply += amount;
+        balanceOf[receiver] += amount;
+
+        // External call to receiver
+        IFlashMintReceiver(receiver).onFlashMint(msg.sender, amount, data);
+
+        // VULNERABILITY (SUBTLE): Checking receiver balance, not that they burned tokens
+        require(balanceOf[receiver] >= balanceBefore, "Flash mint not repaid");
+
+        // Missing: actual burn of the flash minted tokens
+    }
+
+    // NEW: Airdrop function
+    function airdrop(address[] calldata recipients, uint256[] calldata amounts) external {
+        require(msg.sender == owner, "Not owner");
+        // VULNERABILITY (OBVIOUS): No length check - arrays could mismatch
+        for (uint256 i = 0; i < recipients.length; i++) {
+            balanceOf[recipients[i]] += amounts[i];
+            totalSupply += amounts[i];
+            emit Transfer(address(0), recipients[i], amounts[i]);
+        }
+    }
+
     receive() external payable {}
+}
+
+interface IFlashMintReceiver {
+    function onFlashMint(address initiator, uint256 amount, bytes calldata data) external;
 }
